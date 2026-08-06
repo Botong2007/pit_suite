@@ -210,6 +210,10 @@ impl CacheModel {
         false
     }
 
+    pub fn line_size(&self) -> usize {
+        self.cfg.line_size
+    }
+
     pub fn print_stats(&self, name: &str) {
         println!("--- {name} ---");
         println!(

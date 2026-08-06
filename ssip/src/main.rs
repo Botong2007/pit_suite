@@ -53,6 +53,10 @@ struct Args {
     /// Dump branch trace to path path
     #[arg(short = 'B', long)]
     branch_trace: Option<String>,
+
+    /// Track instructions executed while in kernel mode
+    #[arg(short = 'K', long)]
+    kernel_tracker: bool,
 }
 
 fn inst_mix(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
@@ -523,30 +527,88 @@ fn dcache_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
     }
 }
 
+fn cold_miss_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
+    if finish {
+        println!("--- Cold Miss Profiler ---");
+        let line_size = state
+            .dcache
+            .as_ref()
+            .map(CacheModel::line_size)
+            .unwrap_or(64) as u64;
+        if state.pc_annot {
+            println!("ICache Cold Misses: {}", state.icache_cold_misses);
+            println!(
+                "ICache ROI Working Set: {} B ({} lines)",
+                state.icache_roi_lines.len() as u64 * line_size,
+                state.icache_roi_lines.len()
+            );
+        } else {
+            println!("ICache Cold Misses: n/a (--pc-annot required)");
+            println!("ICache ROI Working Set: n/a (--pc-annot required)");
+        }
+        println!("DCache Cold Misses: {}", state.dcache_cold_misses);
+        println!(
+            "DCache ROI Working Set: {} B ({} lines)",
+            state.dcache_roi_lines.len() as u64 * line_size,
+            state.dcache_roi_lines.len()
+        );
+        return;
+    }
+
+    let pkt = pkt.unwrap();
+    let line_size = state
+        .dcache
+        .as_ref()
+        .map(CacheModel::line_size)
+        .unwrap_or(64) as u64;
+
+    if state.pc_annot {
+        let line_addr = state.pc / line_size;
+        state.icache_roi_lines.insert(line_addr);
+        if state.icache_cold_lines.insert(line_addr) {
+            state.icache_cold_misses += 1;
+        }
+    }
+
+    if (pkt.inst.load() || pkt.inst.store())
+        && let Some(addr) = pkt.addr
+    {
+        let line_addr = addr / line_size;
+        state.dcache_roi_lines.insert(line_addr);
+        if state.dcache_cold_lines.insert(line_addr) {
+            state.dcache_cold_misses += 1;
+        }
+    }
+}
+
 fn branch_trace_dump(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
     if finish {
         println!("[inf] branch trace dumped");
     } else {
-        // trace fmt: pc, jump addr, cond, indir, call, ret
-        let inst = pkt.unwrap().inst;
+        // trace fmt: pc, jump addr, cond, indir, call, ret, isDirect, isCompressed
+        let pkt = pkt.unwrap();
+        let inst = pkt.inst;
         if !inst.branch() {
             return;
         };
 
-        let jmp_pc = pkt.unwrap().addr.unwrap();
+        let jmp_pc = pkt.addr.unwrap();
+        let is_compressed = pkt.compressed as u8;
         let branch_trace_fp = state.branch_trace_fp.as_mut().unwrap();
 
         match inst {
             JALR { rd, rs1, .. } => {
                 writeln!(
                     branch_trace_fp,
-                    "{:08x},{:08x},{},{},{},{}",
+                    "{:08x},{:08x},{},{},{},{},{},{}",
                     state.pc,
                     jmp_pc,
                     0,
                     1,
                     (rd == 1 || rd == 5) as u8,
-                    ((rs1 == 1 || rs1 == 5) && rd != rs1) as u8
+                    ((rs1 == 1 || rs1 == 5) && rd != rs1) as u8,
+                    0,
+                    is_compressed
                 )
                 .expect("[err] failed to write to branch trace");
             }
@@ -554,29 +616,144 @@ fn branch_trace_dump(state: &mut TracerState, pkt: Option<&PitInst>, finish: boo
             JAL { rd, .. } => {
                 writeln!(
                     branch_trace_fp,
-                    "{:08x},{:08x},{},{},{},{}",
+                    "{:08x},{:08x},{},{},{},{},{},{}",
                     state.pc,
                     jmp_pc,
                     0,
                     0,
                     (rd == 1 || rd == 5) as u8,
-                    0
+                    0,
+                    1,
+                    is_compressed
                 )
                 .expect("[err] failed to write to branch trace");
             }
 
             // check for taken branches
-            _ if (state.pc + (if pkt.unwrap().compressed { 2 } else { 4 })) != jmp_pc => {
+            _ if (state.pc + (if pkt.compressed { 2 } else { 4 })) != jmp_pc => {
                 writeln!(
                     branch_trace_fp,
-                    "{:08x},{:08x},{},{},{},{}",
-                    state.pc, jmp_pc, 1, 0, 0, 0
+                    "{:08x},{:08x},{},{},{},{},{},{}",
+                    state.pc, jmp_pc, 1, 0, 0, 0, 1, is_compressed
                 )
                 .expect("[err] failed to write to branch trace");
             }
 
             _ => (),
         }
+    }
+}
+
+fn kernel_tracker(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
+    if finish {
+        println!("--- Kernel Tracker ---");
+        println!(
+            "Kernel Instructions: {} ({:.2}%)",
+            state.kernel_insts,
+            100.0 * (state.kernel_insts as f64) / (state.insts as f64)
+        );
+        return;
+    }
+
+    let inst = pkt.unwrap().inst;
+
+    if state.kernel_depth > 0 {
+        state.kernel_insts += 1;
+    }
+
+    match inst {
+        ECALL => state.kernel_depth += 1,
+        SRET | MRET | EBREAK => state.kernel_depth = state.kernel_depth.saturating_sub(1),
+        _ => (),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pkt(inst: riscv_isa::Instruction) -> PitInst {
+        PitInst {
+            inst,
+            addr: None,
+            compressed: false,
+        }
+    }
+
+    fn mem_pkt(addr: u64) -> PitInst {
+        PitInst {
+            inst: LD {
+                rd: 1,
+                rs1: 2,
+                offset: 0,
+            },
+            addr: Some(addr),
+            compressed: false,
+        }
+    }
+
+    #[test]
+    fn kernel_tracker_counts_between_entry_and_exit() {
+        let mut state = TracerState::default();
+
+        kernel_tracker(&mut state, Some(&pkt(ECALL)), false);
+        kernel_tracker(
+            &mut state,
+            Some(&pkt(ADDI {
+                rd: 0,
+                rs1: 0,
+                imm: 0,
+            })),
+            false,
+        );
+        kernel_tracker(&mut state, Some(&pkt(SRET)), false);
+        kernel_tracker(
+            &mut state,
+            Some(&pkt(ADDI {
+                rd: 0,
+                rs1: 0,
+                imm: 0,
+            })),
+            false,
+        );
+
+        assert_eq!(state.kernel_depth, 0);
+        assert_eq!(state.kernel_insts, 2);
+    }
+
+    #[test]
+    fn cold_miss_reset_keeps_warm_lines() {
+        let mut state = TracerState {
+            pc_annot: true,
+            pc: 0x1000,
+            ..Default::default()
+        };
+
+        cold_miss_profiler(&mut state, Some(&mem_pkt(0x2000)), false);
+        assert_eq!(state.icache_cold_misses, 1);
+        assert_eq!(state.dcache_cold_misses, 1);
+        assert_eq!(state.icache_roi_lines.len(), 1);
+        assert_eq!(state.dcache_roi_lines.len(), 1);
+
+        state.reset_for_measurement(false);
+        assert_eq!(state.icache_cold_misses, 0);
+        assert_eq!(state.dcache_cold_misses, 0);
+        assert!(state.icache_roi_lines.is_empty());
+        assert!(state.dcache_roi_lines.is_empty());
+
+        state.pc = 0x1004;
+        cold_miss_profiler(&mut state, Some(&mem_pkt(0x2008)), false);
+        assert_eq!(state.icache_cold_misses, 0);
+        assert_eq!(state.dcache_cold_misses, 0);
+        assert_eq!(state.icache_roi_lines.len(), 1);
+        assert_eq!(state.dcache_roi_lines.len(), 1);
+
+        state.pc = 0x1040;
+        cold_miss_profiler(&mut state, Some(&mem_pkt(0x2040)), false);
+        assert_eq!(state.icache_cold_misses, 1);
+        assert_eq!(state.dcache_cold_misses, 1);
+        assert_eq!(state.icache_roi_lines.len(), 2);
+        assert_eq!(state.dcache_roi_lines.len(), 2);
     }
 }
 
@@ -1038,6 +1215,7 @@ fn main() {
             }
         },
     };
+    handlers.push(cold_miss_profiler);
 
     if args.branch_trace.is_some() && !args.pc_annot {
         eprintln!("[err] cannot dump branch traces without a PC-annotated PIT dump");
@@ -1057,6 +1235,10 @@ fn main() {
             }
         },
     };
+
+    if args.kernel_tracker {
+        handlers.push(kernel_tracker);
+    }
 
     // read out the starting PC on annotated traces
     let start_pc = if args.pc_annot {
@@ -1150,19 +1332,30 @@ fn main() {
                 let opcode = u32::from_le_bytes(ibuf) & 0x7F;
                 if matches!(opcode, 0x7 | 0x27 | 0x57) {
                     state.vector += 1;
+
+                    // GCPT has some vector loads in the beginning (vl1re64)
+                    if matches!(opcode, 0x7 | 0x27) {
+                        let mut _dmmy = [0u8; 8];
+
+                        tracereader
+                            .read_exact(&mut _dmmy)
+                            .expect("[err] faulted while parsing a vld/vls addr");
+                    }
                 } else if opcode == 0xb {
                     let mut npcbuf = [0u8; 8];
 
-                    tracereader.read_exact(&mut npcbuf)
+                    tracereader
+                        .read_exact(&mut npcbuf)
                         .expect("[err] faulted while parsing a trap pc");
 
                     let npc = u64::from_le_bytes(npcbuf);
 
                     if state.insts < state.asm_range {
-                        println!(
-                            "redirect: 0x{:08x} -> 0x{:08x}",
-                            state.pc, npc
-                        );
+                        println!("redirect: 0x{:08x} -> 0x{:08x}", state.pc, npc);
+                    }
+
+                    if args.kernel_tracker {
+                        state.kernel_depth += 1;
                     }
 
                     state.pc = npc;

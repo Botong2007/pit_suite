@@ -1,5 +1,5 @@
 use crate::cache::CacheModel;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 
 #[derive(Clone, Copy)]
@@ -15,6 +15,10 @@ pub struct TracerState {
     pub insts: u64,
     pub compressed: u64,
     pub vector: u64,
+
+    // kernel tracker
+    pub kernel_depth: u64,
+    pub kernel_insts: u64,
 
     pub pc_annot: bool,
     pub pc: u64,
@@ -62,6 +66,14 @@ pub struct TracerState {
     // cache models
     pub dcache: Option<CacheModel>,
 
+    // cold miss profiler
+    pub icache_cold_lines: HashSet<u64>,
+    pub dcache_cold_lines: HashSet<u64>,
+    pub icache_roi_lines: HashSet<u64>,
+    pub dcache_roi_lines: HashSet<u64>,
+    pub icache_cold_misses: u64,
+    pub dcache_cold_misses: u64,
+
     // branch trace dumper
     pub branch_trace_fp: Option<File>,
 }
@@ -73,7 +85,10 @@ impl TracerState {
         let asm_range = self.asm_range;
         let pc_annot = self.pc_annot;
         let pc = self.pc;
+        let kernel_depth = self.kernel_depth;
         let mut dcache = self.dcache.take();
+        let icache_cold_lines = std::mem::take(&mut self.icache_cold_lines);
+        let dcache_cold_lines = std::mem::take(&mut self.dcache_cold_lines);
         let branch_trace_fp = self.branch_trace_fp.take();
 
         if let Some(dcache) = dcache.as_mut() {
@@ -83,11 +98,14 @@ impl TracerState {
         *self = Self {
             pc_annot,
             pc,
+            kernel_depth,
             winsize,
             prunesize,
             verbose,
             asm_range,
             dcache,
+            icache_cold_lines,
+            dcache_cold_lines,
             branch_trace_fp,
             ..Default::default()
         };
