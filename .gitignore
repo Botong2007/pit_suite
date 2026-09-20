@@ -1,0 +1,8 @@
+# external clones, not part of this repo
+nexus-am/
+
+# generated traces and analysis output
+traces/
+results/
+*.pit
+ilp*.txt

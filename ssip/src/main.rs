@@ -257,20 +257,105 @@ fn dfg_gen(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
     }
 }
 
+// BOOM-inspired per-instruction cycle latencies for the ILP/DFG analyzer
+//
+// This replaces the flat `vtick += 1;` (every instruction takes exactly one
+// cycle) with a per-instruction-class latency, modeled after the Berkeley
+// Out-of-Order Machine's functional-unit design. It also adds structural
+// hazard tracking for BOOM's two non-pipelined units (IDiv, FDivSqrt), since
+// unlike everything else in this scoreboard, a real divide/sqrt unit can only
+// have one operation in flight at a time.
+//
+// Sources / confidence level for each constant:
+//   - ALU_LATENCY = 1
+//   - SFMA_LATENCY / DFMA_LATENCY = 4 / 4
+//   - FPMU_LATENCY = 2, IFPU_LATENCY = 2
+//   - IMUL_LATENCY = 3
+//   - IDIV_LATENCY, FDIVSQRT_S/D_LATENCY
+//   - LOAD_LATENCY = 3, STORE_LATENCY = 1, AMO_LATENCY = 5, BRANCH/MISC = 1
+
+ 
+const ALU_LATENCY: usize = 1; // ALU / logic / shift / LUI / AUIPC / Zba-Zbb-Zbs-Zbkb
+const BRANCH_LATENCY: usize = 1; // branch/jump resolution
+const MISC_LATENCY: usize = 1; // CSR/system (already forced to serialize elsewhere)
+const LOAD_LATENCY: usize = 3; // L1 D$ hit, load-to-use
+const STORE_LATENCY: usize = 1; // address/data ready for the store buffer
+const AMO_LATENCY: usize = 5; // LR/SC/AMO*: modeled as a load+store round trip
+ 
+const IMUL_LATENCY: usize = 3; // pipelined integer multiplier
+const IDIV_LATENCY: usize = 40; // iterative/non-pipelined; fixed stand-in
+ 
+const SFMA_LATENCY: usize = 4; // single-precision fused multiply-add (BOOM default)
+const DFMA_LATENCY: usize = 4; // double-precision fused multiply-add (BOOM default)
+const FPMU_LATENCY: usize = 2; // FP-multiply-only path
+const IFPU_LATENCY: usize = 2; // int<->float conversion
+const FPU_LATENCY: usize = 3; // catch-all: FADD/FSUB/FCMP/FSGNJ/FCLASS/FMV/etc.
+const FDIVSQRT_S_LATENCY: usize = 12; // FDIV.S / FSQRT.S -- iterative, non-pipelined
+const FDIVSQRT_D_LATENCY: usize = 24; // FDIV.D / FSQRT.D -- iterative, non-pipelined
+ 
+/// Returns the number of cycles `inst` takes to produce its result, following
+/// BOOM's functional-unit latency model instead of a flat 1-cycle assumption.
+fn inst_latency(inst: &riscv_isa::Instruction) -> usize {
+    use riscv_isa::Instruction::*;
+ 
+    match inst {
+        // integer multiply (RV64M)
+        MUL { .. } | MULH { .. } | MULHU { .. } | MULHSU { .. } | MULW { .. } => IMUL_LATENCY,
+ 
+        //  fused multiply-add (RV32/64 F/D) ---
+        FMADD_S { .. } | FMSUB_S { .. } | FNMSUB_S { .. } | FNMADD_S { .. } => SFMA_LATENCY,
+        FMADD_D { .. } | FMSUB_D { .. } | FNMSUB_D { .. } | FNMADD_D { .. } => DFMA_LATENCY,
+ 
+        // --- FP multiply-only, if your ISA models it separately from FMA ---
+        FMUL_S { .. } => FPMU_LATENCY,
+        FMUL_D { .. } => FPMU_LATENCY,
+ 
+        // --- int<->float conversion ---
+        FCVT_W_S { .. } | FCVT_WU_S { .. } | FCVT_L_S { .. } | FCVT_LU_S { .. }
+        | FCVT_S_W { .. } | FCVT_S_WU { .. } | FCVT_S_L { .. } | FCVT_S_LU { .. }
+        | FCVT_W_D { .. } | FCVT_WU_D { .. } | FCVT_L_D { .. } | FCVT_LU_D { .. }
+        | FCVT_D_W { .. } | FCVT_D_WU { .. } | FCVT_D_L { .. } | FCVT_D_LU { .. } => IFPU_LATENCY,
+ 
+        // FP divide / sqrt: iterative, non-pipelined ---
+        FDIV_S { .. } | FSQRT_S { .. } => FDIVSQRT_S_LATENCY,
+        FDIV_D { .. } | FSQRT_D { .. } => FDIVSQRT_D_LATENCY,
+ 
+        // --- atomics: LR/SC/AMO* (same variant set as amoprof's match) ---
+        LR_W { .. } | LR_D { .. } | SC_W { .. } | SC_D { .. }
+        | AMOSWAP_W { .. } | AMOSWAP_D { .. } | AMOADD_W { .. } | AMOADD_D { .. }
+        | AMOXOR_W { .. } | AMOXOR_D { .. } | AMOAND_W { .. } | AMOAND_D { .. }
+        | AMOOR_W { .. } | AMOOR_D { .. } | AMOMIN_W { .. } | AMOMIN_D { .. }
+        | AMOMAX_W { .. } | AMOMAX_D { .. } | AMOMINU_W { .. } | AMOMINU_D { .. }
+        | AMOMAXU_W { .. } | AMOMAXU_D { .. } => AMO_LATENCY,
+ 
+        // --- everything else: fall back to the ISA crate's own classifiers ---
+        _ if inst.div() => IDIV_LATENCY, // integer DIV/DIVU/REM/REMU/*W
+        _ if inst.load() => LOAD_LATENCY,
+        _ if inst.store() => STORE_LATENCY,
+        _ if inst.float() => FPU_LATENCY, // remaining FADD/FSUB/FCMP/FSGNJ/FCLASS/FMV etc.
+        _ if inst.branch() => BRANCH_LATENCY,
+        _ if inst.misc() => MISC_LATENCY,
+        _ => ALU_LATENCY,
+    }
+}
+ 
+// dfg_traverse -- unchanged structure, now latency-aware + divider hazards
 fn dfg_traverse(state: &TracerState) {
     let mut l_ctrl = 0usize;
     let mut l_ser = 0usize;
     let mut l_memser = 0usize;
     let mut l_mem = 0usize;
+    let mut l_idiv = 0usize; // NEW: BOOM's IDiv is a single, non-pipelined unit
+    let mut l_fdivsqrt = 0usize; // NEW: BOOM's FDivSqrt is likewise non-pipelined & shared
     let mut memticks: HashMap<u64, usize> = HashMap::new();
     let mut intregdep = [0usize; 32];
     let mut flregdep = [0usize; 32];
     let mut maxtick = 0;
-
+ 
     for pkt in &state.dfg_window {
         let inst = &pkt.inst;
         let mut vtick = 0;
-
+ 
         if let Some(rs1) = inst.get_rs1() {
             vtick = vtick.max(intregdep[rs1 as usize]);
         }
@@ -286,7 +371,7 @@ fn dfg_traverse(state: &TracerState) {
         if let Some(frs3) = inst.get_frs3() {
             vtick = vtick.max(flregdep[frs3 as usize]);
         }
-
+ 
         if inst.mem() {
             let vaddr = pkt.addr.unwrap();
             vtick = vtick.max(*memticks.get(&vaddr).unwrap_or(&0));
@@ -301,10 +386,22 @@ fn dfg_traverse(state: &TracerState) {
         if matches!(inst, FENCE { .. }) {
             vtick = vtick.max(l_mem);
         }
+ 
+        // NEW: structural hazard -- only one divide (int or FP) may be
+        // "inside" BOOM's non-pipelined divider at a time.
+        let is_idiv = inst.div();
+        let is_fdivsqrt = matches!(inst, FDIV_S { .. } | FSQRT_S { .. } | FDIV_D { .. } | FSQRT_D { .. });
+        if is_idiv {
+            vtick = vtick.max(l_idiv);
+        }
+        if is_fdivsqrt {
+            vtick = vtick.max(l_fdivsqrt);
+        }
+ 
         vtick = vtick.max(l_ser);
-        vtick += 1;
+        vtick += inst_latency(inst); // CHANGED: was `vtick += 1;`
         maxtick = maxtick.max(vtick);
-
+ 
         if let Some(rd) = inst.get_rd() {
             intregdep[rd as usize] = vtick;
         }
@@ -325,8 +422,14 @@ fn dfg_traverse(state: &TracerState) {
         if matches!(inst, FENCE { .. }) {
             l_memser = vtick;
         }
+        if is_idiv {
+            l_idiv = vtick; // divider busy until this op's result tick
+        }
+        if is_fdivsqrt {
+            l_fdivsqrt = vtick;
+        }
     }
-
+ 
     let wlen = state.dfg_window.len();
     println!(
         "Window @ {}: {wlen} insts, {maxtick} ticks, ILP {:.2}",
@@ -334,23 +437,26 @@ fn dfg_traverse(state: &TracerState) {
         wlen as f64 / maxtick as f64
     );
 }
-
+ 
+// dfg_traverse_verbose -- same change, plus dep labels for the divider hazard
 fn dfg_traverse_verbose(state: &TracerState) {
     let none: usize = usize::MAX;
     let mut l_ctrl = (0usize, none);
     let mut l_ser = (0usize, none);
     let mut l_memser = (0usize, none);
     let mut l_mem = (0usize, none);
+    let mut l_idiv = (0usize, none); // NEW
+    let mut l_fdivsqrt = (0usize, none); // NEW
     let mut memticks: HashMap<u64, (usize, usize)> = HashMap::new();
     let mut intregdep = [(0usize, none); 32];
     let mut flregdep = [(0usize, none); 32];
     let mut maxtick = 0;
-
+ 
     for (i, pkt) in state.dfg_window.iter().enumerate() {
         let inst = &pkt.inst;
         let mut vtick = 0;
         let mut deps: Vec<(usize, &str)> = Vec::new();
-
+ 
         if let Some(rs1) = inst.get_rs1() {
             let (tick, prod) = intregdep[rs1 as usize];
             if tick > vtick {
@@ -396,7 +502,7 @@ fn dfg_traverse_verbose(state: &TracerState) {
                 deps.push((prod, "frs3"));
             }
         }
-
+ 
         if inst.mem() {
             let vaddr = pkt.addr.unwrap();
             if let Some(&(tick, prod)) = memticks.get(&vaddr) {
@@ -434,22 +540,44 @@ fn dfg_traverse_verbose(state: &TracerState) {
                 deps.push((l_mem.1, "fence"));
             }
         }
+ 
+        // NEW: structural hazard on BOOM's non-pipelined dividers
+        let is_idiv = inst.div();
+        let is_fdivsqrt = matches!(inst, FDIV_S { .. } | FSQRT_S { .. } | FDIV_D { .. } | FSQRT_D { .. });
+        if is_idiv {
+            if l_idiv.0 > vtick {
+                vtick = l_idiv.0;
+            }
+            if l_idiv.1 != none {
+                deps.push((l_idiv.1, "idiv-busy"));
+            }
+        }
+        if is_fdivsqrt {
+            if l_fdivsqrt.0 > vtick {
+                vtick = l_fdivsqrt.0;
+            }
+            if l_fdivsqrt.1 != none {
+                deps.push((l_fdivsqrt.1, "fdiv-busy"));
+            }
+        }
+ 
         if l_ser.0 > vtick {
             vtick = l_ser.0;
         }
         if l_ser.1 != none {
             deps.push((l_ser.1, "ser"));
         }
-
-        vtick += 1;
+ 
+        let lat = inst_latency(inst); // CHANGED
+        vtick += lat;
         maxtick = maxtick.max(vtick);
-
+ 
         let dep_str: Vec<String> = deps
             .iter()
             .map(|(prod, kind)| format!("#{prod}({kind})"))
             .collect();
-        println!("  [{i}] {inst} @ tick {vtick} <- [{}]", dep_str.join(", "));
-
+        println!("  [{i}] {inst} @ tick {vtick} (+{lat}) <- [{}]", dep_str.join(", "));
+ 
         if let Some(rd) = inst.get_rd() {
             intregdep[rd as usize] = (vtick, i);
         }
@@ -474,8 +602,14 @@ fn dfg_traverse_verbose(state: &TracerState) {
         if matches!(inst, FENCE { .. }) {
             l_memser = (vtick, i);
         }
+        if is_idiv {
+            l_idiv = (vtick, i);
+        }
+        if is_fdivsqrt {
+            l_fdivsqrt = (vtick, i);
+        }
     }
-
+ 
     let wlen = state.dfg_window.len();
     println!(
         "Window @ {}: {wlen} insts, {maxtick} ticks, ILP {:.2}",
@@ -483,8 +617,9 @@ fn dfg_traverse_verbose(state: &TracerState) {
         wlen as f64 / maxtick as f64
     );
 }
+ 
 
-fn asm_dump(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
+fn asm_dump(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {  
     if !finish && state.insts <= state.asm_range {
         if state.pc_annot && state.insts == 1 {
             println!("start @ 0x{:08x}", state.pc);
@@ -1167,18 +1302,18 @@ fn dump_stats(
 }
 
 fn main() {
-    let mut handlers: Vec<fn(&mut TracerState, Option<&PitInst>, bool)> =
+    let mut handlers: Vec<fn(&mut TracerState, Option<&PitInst>, bool)> =  //the funtion in the vec is the type expected
         vec![amoprof, inst_mix, fusion_profiler];
     let args = Args::parse();
 
-    let trace = match File::open(&args.tracefile) {
+    let trace = match File::open(&args.tracefile) { 
         Err(_) => {
             eprintln!("[err] invalid tracefile");
             return;
         }
         Ok(f) => f,
     };
-    let mut tracereader = BufReader::new(trace);
+    let mut tracereader = BufReader::new(trace); 
 
     // omitted from Xiangshan Spec due to package compat: KHV
     let target = Target::from_str("RV64IMAFDCZicsr_Zifencei_Zba_Zbb_Zbs_Zbkb")
